@@ -287,10 +287,12 @@ class MTUServer:
             while self.running:
                 try:
                     data, addr = sock.recvfrom(1024)
+                    logging.debug(f"Received {len(data)} bytes from {addr}")
                     self.client_address = addr
                     
                     try:
                         message = MTUMessage.unpack(data)
+                        logging.debug(f"Unpacked message: type={message.msg_type}, data={message.data}")
                         await self.handle_message(message, sock, addr)
                     except Exception as e:
                         logging.error(f"Error handling message: {e}")
@@ -301,16 +303,20 @@ class MTUServer:
                     logging.error(f"Server error: {e}")
                     break
         finally:
+            logging.debug("Closing server socket")
             sock.close()
     
     async def handle_message(self, message: MTUMessage, sock: socket.socket, addr):
         """Handle incoming messages"""
+        logging.debug(f"Handling message type: {message.msg_type} from {addr}")
         if message.msg_type == MESSAGE_TYPES["PING"]:
             response = MTUMessage(MESSAGE_TYPES["PONG"])
+            logging.debug("Sending PONG response")
             sock.sendto(response.pack(), addr)
             
         elif message.msg_type == MESSAGE_TYPES["SET_MTU"]:
             mtu = message.data.get("mtu", 1500)
+            logging.debug(f"Setting server MTU to {mtu}")
             success = self.finder.network_utils.set_interface_mtu(
                 self.config.wg_interface, mtu
             )
@@ -319,6 +325,7 @@ class MTUServer:
                 MESSAGE_TYPES["MTU_SET"],
                 {"success": success, "mtu": mtu}
             )
+            logging.debug(f"Sending MTU_SET response: success={success}, mtu={mtu}")
             sock.sendto(response.pack(), addr)
             
             if success:
