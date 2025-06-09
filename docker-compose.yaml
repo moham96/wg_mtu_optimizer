@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  wg-mtu-server:
+    build: .
+    command: python3 wg_mtu_finder.py --mode server
+    network_mode: host
+    privileged: true
+    volumes:
+      - ./results:/app/wg_mtu_results
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      - PYTHONUNBUFFERED=1
+
+  wg-mtu-client:
+    build: .
+    command: python3 wg_mtu_finder.py --mode client --server-ip ${SERVER_IP:-10.0.0.1}
+    network_mode: host
+    privileged: true
+    volumes:
+      - ./results:/app/wg_mtu_results
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      - wg-mtu-server

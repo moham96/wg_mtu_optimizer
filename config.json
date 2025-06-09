@@ -1,0 +1,20 @@
+{
+    "mtu_min": 1280,
+    "mtu_max": 1500,
+    "mtu_step": 20,
+    "server_port": 12345,
+    "iperf3_port": 5201,
+    "iperf3_duration": 10,
+    "mtu_change_delay": 3,
+    "test_timeout": 30,
+    "ping_timeout": 5,
+    "udp_timeout": 10,
+    "max_retries": 3,
+    "log_level": "INFO",
+    "output_dir": "wg_mtu_results",
+    "csv_filename": "mtu_results.csv",
+    "heatmap_filename": "mtu_heatmap.png",
+    "wg_interface": "wg0",
+    "min_speed_mbps": 1.0,
+    "max_latency_ms": 1000.0
+}

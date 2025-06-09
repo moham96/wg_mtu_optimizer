@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
-WireGuard MTU Finder - Advanced MTU optimization tool for WireGuard peers
-Author: Generated for optimal WireGuard performance testing
-Version: 2.0
+WireGuard MTU Finder - Find optimal MTU combinations for WireGuard peers
+Based on: https://github.com/nitred/nr-wg-mtu-finder
+
+This script tests various MTU combinations between WireGuard peers to find
+the optimal settings for maximum throughput.
+
+Usage:
+    Server mode: python3 wg_mtu_finder.py --mode server
+    Client mode: python3 wg_mtu_finder.py --mode client --server-ip <server_ip>
 """
 
 import argparse
@@ -16,675 +22,638 @@ import struct
 import subprocess
 import sys
 import time
-from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import seaborn as sns
 
-# Color and emoji constants
-class Colors:
-    RED = '\033[91m'
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    BLUE = '\033[94m'
-    MAGENTA = '\033[95m'
-    CYAN = '\033[96m'
-    WHITE = '\033[97m'
-    BOLD = '\033[1m'
-    UNDERLINE = '\033[4m'
-    END = '\033[0m'
-
-class Emojis:
-    ROCKET = "🚀"
-    FIRE = "🔥"
-    CHECK = "✅"
-    CROSS = "❌"
-    WARNING = "⚠️"
-    INFO = "ℹ️"
-    CHART = "📊" 
-    CLOCK = "⏱️"
-    NETWORK = "🌐"
-    SPEED = "💨"
-    ARROW_UP = "⬆️"
-    ARROW_DOWN = "⬇️"
-    GEAR = "⚙️"
-
-# Lightweight messaging protocol using UDP
-class MTUMessenger:
-    """Lightweight UDP-based messaging for MTU coordination"""
+# Configuration
+@dataclass
+class Config:
+    # MTU ranges
+    mtu_min: int = 1280
+    mtu_max: int = 1500
+    mtu_step: int = 20
     
-    def __init__(self, port: int = 12345):
-        self.port = port
-        self.socket = None
-        
-    def start_server(self):
-        """Start UDP server for receiving messages"""
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.socket.bind(('', self.port))
-        self.socket.settimeout(5.0)
-        
-    def send_message(self, host: str, message: str) -> bool:
-        """Send message to peer"""
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.settimeout(3.0)
-            data = message.encode('utf-8')
-            sock.sendto(data, (host, self.port))
-            sock.close()
-            return True
-        except Exception as e:
-            logging.error(f"Failed to send message: {e}")
-            return False
-            
-    def receive_message(self) -> Optional[Tuple[str, str]]:
-        """Receive message from peer"""
-        try:
-            data, addr = self.socket.recvfrom(1024)
-            return data.decode('utf-8'), addr[0]
-        except socket.timeout:
-            return None
-        except Exception as e:
-            logging.error(f"Failed to receive message: {e}")
-            return None
-            
-    def close(self):
-        """Close socket"""
-        if self.socket:
-            self.socket.close()
-
-class WireGuardMTUFinder:
-    """Advanced WireGuard MTU finder with comprehensive testing capabilities"""
+    # Network settings
+    server_port: int = 12345
+    iperf3_port: int = 5201
+    iperf3_duration: int = 10
     
-    def __init__(self, config: Dict):
-        self.config = self._validate_config(config)
-        self.results = defaultdict(dict)
-        self.best_result = {'speed': 0, 'server_mtu': 0, 'peer_mtu': 0}
-        self.messenger = MTUMessenger(self.config.get('messenger_port', 12345))
-        self.setup_logging()
+    # Timing settings
+    mtu_change_delay: int = 3
+    test_timeout: int = 30
+    ping_timeout: int = 5
+    
+    # Messaging settings
+    udp_timeout: int = 10
+    max_retries: int = 3
+    
+    # File settings
+    log_level: str = "INFO"
+    output_dir: str = "wg_mtu_results"
+    csv_filename: str = "mtu_results.csv"
+    heatmap_filename: str = "mtu_heatmap.png"
+    
+    # WireGuard interface
+    wg_interface: str = "wg0"
+    
+    # Performance thresholds
+    min_speed_mbps: float = 1.0  # Minimum acceptable speed
+    max_latency_ms: float = 1000.0  # Maximum acceptable latency
+
+# Message types for UDP communication
+MESSAGE_TYPES = {
+    "PING": 1,
+    "PONG": 2,
+    "SET_MTU": 3,
+    "MTU_SET": 4,
+    "START_TEST": 5,
+    "TEST_COMPLETE": 6,
+    "ERROR": 7,
+    "TERMINATE": 8
+}
+
+@dataclass
+class TestResult:
+    server_mtu: int
+    client_mtu: int
+    upload_speed: float
+    download_speed: float
+    latency: float
+    packet_loss: float
+    timestamp: str
+    success: bool
+    error_message: str = ""
+
+class MTUMessage:
+    """Lightweight UDP message protocol for MTU coordination"""
+    
+    def __init__(self, msg_type: int, data: dict = None):
+        self.msg_type = msg_type
+        self.data = data or {}
+        self.timestamp = time.time()
+    
+    def pack(self) -> bytes:
+        """Pack message into bytes"""
+        json_data = json.dumps(self.data).encode('utf-8')
+        header = struct.pack('!IBd', self.msg_type, len(json_data), self.timestamp)
+        return header + json_data
+    
+    @classmethod
+    def unpack(cls, data: bytes) -> 'MTUMessage':
+        """Unpack bytes into message"""
+        if len(data) < 13:  # Minimum header size
+            raise ValueError("Message too short")
         
-    def _validate_config(self, config: Dict) -> Dict:
-        """Validate and sanitize configuration"""
-        # Ensure MTU values are reasonable
-        mtu_min = max(576, min(9000, config.get('mtu_min', 1280)))
-        mtu_max = max(576, min(9000, config.get('mtu_max', 1500)))
+        msg_type, data_len, timestamp = struct.unpack('!IBd', data[:13])
+        json_data = data[13:13+data_len].decode('utf-8')
+        parsed_data = json.loads(json_data)
         
-        if mtu_min >= mtu_max:
-            print(f"{Colors.YELLOW}{Emojis.WARNING} Invalid MTU range: min={mtu_min}, max={mtu_max}{Colors.END}")
-            mtu_min = 1280
-            mtu_max = 1500
-            
-        config['mtu_min'] = mtu_min
-        config['mtu_max'] = mtu_max
-        config['mtu_step'] = max(1, min(100, config.get('mtu_step', 20)))
-        config['test_duration'] = max(5, min(300, config.get('test_duration', 10)))
-        config['mtu_change_delay'] = max(1, min(30, config.get('mtu_change_delay', 2)))
-        
-        return config
-        
-    def setup_logging(self):
-        """Setup logging configuration"""
-        log_level = getattr(logging, self.config.get('log_level', 'INFO').upper())
-        log_format = '%(asctime)s - %(levelname)s - %(message)s'
-        
-        # Console handler with colors
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(log_level)
-        
-        # File handler
-        log_file = Path(self.config.get('log_dir', './logs')) / f"mtu_finder_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-        log_file.parent.mkdir(exist_ok=True)
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setLevel(log_level)
-        
-        # Configure logging
-        logging.basicConfig(
-            level=log_level,
-            format=log_format,
-            handlers=[console_handler, file_handler]
-        )
-        
-        self.logger = logging.getLogger(__name__)
-        self.log_file = log_file
-        
-    def print_colored(self, message: str, color: str = Colors.WHITE, emoji: str = ""):
-        """Print colored message with emoji"""
-        print(f"{color}{emoji} {message}{Colors.END}")
-        
-    def print_header(self, title: str):
-        """Print formatted header"""
-        border = "=" * (len(title) + 4)
-        self.print_colored(border, Colors.CYAN, Emojis.ROCKET)
-        self.print_colored(f"  {title}  ", Colors.CYAN, Emojis.ROCKET)
-        self.print_colored(border, Colors.CYAN, Emojis.ROCKET)
-        
-    def get_current_mtu(self, interface: str) -> int:
-        """Get current MTU of interface"""
+        msg = cls(msg_type, parsed_data)
+        msg.timestamp = timestamp
+        return msg
+
+class NetworkUtils:
+    """Network utility functions"""
+    
+    @staticmethod
+    def get_interface_mtu(interface: str) -> int:
+        """Get current MTU of network interface"""
         try:
-            result = subprocess.run(['ip', 'link', 'show', interface], 
-                                  capture_output=True, text=True, check=True)
+            result = subprocess.run(
+                ["ip", "link", "show", interface],
+                capture_output=True, text=True, timeout=5
+            )
             for line in result.stdout.split('\n'):
                 if 'mtu' in line:
-                    return int(line.split('mtu')[1].split()[0])
+                    return int(line.split('mtu ')[1].split()[0])
         except Exception as e:
-            self.logger.error(f"Failed to get MTU for {interface}: {e}")
-        return 1420  # Default WireGuard MTU
-        
-    def set_mtu(self, interface: str, mtu: int) -> bool:
-        """Set MTU for interface"""
+            logging.error(f"Error getting MTU for {interface}: {e}")
+        return 1500  # Default MTU
+    
+    @staticmethod
+    def set_interface_mtu(interface: str, mtu: int) -> bool:
+        """Set MTU for network interface"""
         try:
-            subprocess.run(['sudo', 'ip', 'link', 'set', 'dev', interface, 'mtu', str(mtu)], 
-                          check=True, capture_output=True)
-            self.logger.info(f"Set MTU {mtu} on {interface}")
-            return True
-        except subprocess.CalledProcessError as e:
-            self.logger.error(f"Failed to set MTU {mtu} on {interface}: {e}")
+            result = subprocess.run(
+                ["sudo", "ip", "link", "set", "dev", interface, "mtu", str(mtu)],
+                capture_output=True, text=True, timeout=10
+            )
+            return result.returncode == 0
+        except Exception as e:
+            logging.error(f"Error setting MTU {mtu} for {interface}: {e}")
             return False
-            
-    def run_iperf3_test(self, server_ip: str, duration: int = 10, 
-                       direction: str = 'download') -> Optional[float]:
-        """Run iperf3 speed test"""
+
+class IPerf3Runner:
+    """IPerf3 test runner"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+    
+    def run_server(self) -> subprocess.Popen:
+        """Start iperf3 server"""
+        cmd = [
+            "iperf3", "-s", "-p", str(self.config.iperf3_port),
+            "-1"  # Exit after one test
+        ]
+        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    
+    def run_client(self, server_ip: str, reverse: bool = False) -> Tuple[float, float]:
+        """Run iperf3 client test"""
+        cmd = [
+            "iperf3", "-c", server_ip, "-p", str(self.config.iperf3_port),
+            "-t", str(self.config.iperf3_duration),
+            "-J"  # JSON output
+        ]
+        
+        if reverse:
+            cmd.append("-R")
+        
         try:
-            if direction == 'upload':
-                cmd = ['iperf3', '-c', server_ip, '-t', str(duration), '-R', '-J']
-            else:
-                cmd = ['iperf3', '-c', server_ip, '-t', str(duration), '-J']
-                
-            result = subprocess.run(cmd, capture_output=True, text=True, 
-                                  timeout=duration + 10)
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, 
+                timeout=self.config.iperf3_duration + 10
+            )
             
             if result.returncode == 0:
                 data = json.loads(result.stdout)
-                # Get bits per second and convert to Mbps
-                bps = data['end']['sum_received']['bits_per_second']
-                mbps = bps / 1_000_000
-                return mbps
-            else:
-                self.logger.error(f"iperf3 failed: {result.stderr}")
-                return None
+                if 'end' in data and 'sum_received' in data['end']:
+                    bps = data['end']['sum_received']['bits_per_second']
+                    return bps / 1_000_000, 0  # Convert to Mbps
                 
-        except subprocess.TimeoutExpired:
-            self.logger.error("iperf3 test timed out")
-            return None
         except Exception as e:
-            self.logger.error(f"iperf3 test failed: {e}")
-            return None
+            logging.error(f"IPerf3 client error: {e}")
+        
+        return 0.0, 0.0
+
+class MTUFinder:
+    """Main MTU finder class"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.network_utils = NetworkUtils()
+        self.iperf3 = IPerf3Runner(config)
+        self.results: List[TestResult] = []
+
+        # Create output directory
+        Path(self.config.output_dir).mkdir(exist_ok=True)
+        
+        # Setup logging
+        self.setup_logging()
+        
+    
+    def setup_logging(self):
+        """Setup logging configuration"""
+        log_format = '%(asctime)s - %(levelname)s - %(message)s'
+        log_file = Path(self.config.output_dir) / 'mtu_finder.log'
+        
+        logging.basicConfig(
+            level=getattr(logging, self.config.log_level),
+            format=log_format,
+            handlers=[
+                logging.FileHandler(log_file),
+                logging.StreamHandler()
+            ]
+        )
+    
+    def ping_test(self, target_ip: str) -> Tuple[float, float]:
+        """Perform ping test to measure latency and packet loss"""
+        try:
+            result = subprocess.run([
+                "ping", "-c", "5", "-W", str(self.config.ping_timeout), target_ip
+            ], capture_output=True, text=True, timeout=self.config.ping_timeout + 5)
             
-    def test_mtu_combination(self, server_mtu: int, peer_mtu: int, 
-                           peer_ip: str) -> Optional[Dict]:
-        """Test a specific MTU combination"""
-        interface = self.config.get('interface', 'wg0')
+            if result.returncode == 0:
+                lines = result.stdout.split('\n')
+                latency = 999.0
+                loss = 100.0
+                
+                for line in lines:
+                    # Parse packet loss: "5 packets transmitted, 5 received, 0% packet loss"
+                    if 'packet loss' in line:
+                        try:
+                            loss_str = line.split('%')[0].split()[-1]
+                            loss = float(loss_str)
+                        except (IndexError, ValueError):
+                            pass
+                    
+                    # Parse latency: "rtt min/avg/max/mdev = 0.123/0.456/0.789/0.012 ms"
+                    if 'rtt min/avg/max' in line or ('avg' in line and 'ms' in line and '/' in line):
+                        try:
+                            # Extract the part after '='
+                            if '=' in line:
+                                stats_part = line.split('=')[1].strip()
+                                # Remove 'ms' and split by '/'
+                                stats_part = stats_part.replace('ms', '').strip()
+                                values = stats_part.split('/')
+                                if len(values) >= 2:
+                                    latency = float(values[1])  # avg is the second value
+                        except (IndexError, ValueError):
+                            pass
+                
+                return latency, loss
+        except Exception as e:
+            logging.error(f"Ping test error: {e}")
         
-        # Set local MTU
-        if not self.set_mту(interface, server_mtu):
-            return None
+        return 999.0, 100.0  # High latency, high loss on error
+
+class MTUServer:
+    """Server component for MTU testing"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.finder = MTUFinder(config)
+        self.running = False
+        self.client_address = None
+    
+    async def start(self):
+        """Start the MTU server"""
+        logging.info(f"Starting MTU server on port {self.config.server_port}")
+        
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(('', self.config.server_port))
+        sock.settimeout(1.0)
+        
+        self.running = True
+        
+        try:
+            while self.running:
+                try:
+                    data, addr = sock.recvfrom(1024)
+                    self.client_address = addr
+                    
+                    try:
+                        message = MTUMessage.unpack(data)
+                        await self.handle_message(message, sock, addr)
+                    except Exception as e:
+                        logging.error(f"Error handling message: {e}")
+                        
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    logging.error(f"Server error: {e}")
+                    break
+        finally:
+            sock.close()
+    
+    async def handle_message(self, message: MTUMessage, sock: socket.socket, addr):
+        """Handle incoming messages"""
+        if message.msg_type == MESSAGE_TYPES["PING"]:
+            response = MTUMessage(MESSAGE_TYPES["PONG"])
+            sock.sendto(response.pack(), addr)
             
-        # Coordinate with peer to set their MTU
-        if not self.coordinate_peer_mtu(peer_ip, peer_mtu):
-            return None
+        elif message.msg_type == MESSAGE_TYPES["SET_MTU"]:
+            mtu = message.data.get("mtu", 1500)
+            success = self.finder.network_utils.set_interface_mtu(
+                self.config.wg_interface, mtu
+            )
             
-        # Wait for MTU changes to take effect
-        time.sleep(self.config.get('mtu_change_delay', 2))
-        
-        # Test connectivity with ping
-        if not self.test_connectivity(peer_ip):
-            self.print_colored(f"No connectivity with MTU {server_mtu}/{peer_mtu}", 
-                             Colors.RED, Emojis.CROSS)
-            return None
+            response = MTUMessage(
+                MESSAGE_TYPES["MTU_SET"],
+                {"success": success, "mtu": mtu}
+            )
+            sock.sendto(response.pack(), addr)
             
-        # Run speed tests
-        test_duration = self.config.get('test_duration', 10)
-        download_speed = self.run_iperf3_test(peer_ip, test_duration, 'download')
-        upload_speed = self.run_iperf3_test(peer_ip, test_duration, 'upload')
-        
-        if download_speed is None or upload_speed is None:
-            return None
+            if success:
+                logging.info(f"Server MTU set to {mtu}")
+                time.sleep(self.config.mtu_change_delay)
             
-        result = {
-            'server_mtu': server_mtu,
-            'peer_mtu': peer_mtu,
-            'download_speed': download_speed,
-            'upload_speed': upload_speed,
-            'avg_speed': (download_speed + upload_speed) / 2,
-            'timestamp': datetime.now().isoformat()
-        }
+        elif message.msg_type == MESSAGE_TYPES["START_TEST"]:
+            # Start iperf3 server
+            server_proc = self.finder.iperf3.run_server()
+            
+            response = MTUMessage(MESSAGE_TYPES["TEST_COMPLETE"])
+            sock.sendto(response.pack(), addr)
+            
+            # Wait for iperf3 to complete
+            server_proc.wait()
+            
+        elif message.msg_type == MESSAGE_TYPES["TERMINATE"]:
+            logging.info("Received termination signal")
+            self.running = False
+
+class MTUClient:
+    """Client component for MTU testing"""
+    
+    def __init__(self, config: Config, server_ip: str):
+        self.config = config
+        self.server_ip = server_ip
+        self.finder = MTUFinder(config)
+        self.sock = None
+    
+    def connect(self) -> bool:
+        """Connect to MTU server"""
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sock.settimeout(self.config.udp_timeout)
+            
+            # Test connection with ping
+            ping_msg = MTUMessage(MESSAGE_TYPES["PING"])
+            self.sock.sendto(ping_msg.pack(), (self.server_ip, self.config.server_port))
+            
+            data, _ = self.sock.recvfrom(1024)
+            response = MTUMessage.unpack(data)
+            
+            if response.msg_type == MESSAGE_TYPES["PONG"]:
+                logging.info("Successfully connected to MTU server")
+                return True
+                
+        except Exception as e:
+            logging.error(f"Connection failed: {e}")
         
-        # Compare with best result
-        if result['avg_speed'] > self.best_result['speed']:
-            improvement = result['avg_speed'] - self.best_result['speed']
-            self.print_colored(f"New best! {result['avg_speed']:.2f} Mbps "
-                             f"(+{improvement:.2f}) with MTU {server_mtu}/{peer_mtu}", 
-                             Colors.GREEN, Emojis.FIRE)
-            self.best_result = {
-                'speed': result['avg_speed'],
-                'server_mtu': server_mtu,
-                'peer_mtu': peer_mtu
-            }
-        else:
-            change = result['avg_speed'] - self.best_result['speed']
-            color = Colors.YELLOW if change > -5 else Colors.RED
-            emoji = Emojis.ARROW_DOWN if change < 0 else Emojis.ARROW_UP
-            self.print_colored(f"Speed: {result['avg_speed']:.2f} Mbps "
-                             f"({change:+.2f}) with MTU {server_mtu}/{peer_mtu}", 
-                             color, emoji)
+        return False
+    
+    def set_server_mtu(self, mtu: int) -> bool:
+        """Set MTU on server"""
+        msg = MTUMessage(MESSAGE_TYPES["SET_MTU"], {"mtu": mtu})
         
-        return result
-        
-    def coordinate_peer_mtu(self, peer_ip: str, mtu: int) -> bool:
-        """Coordinate MTU setting with peer"""
-        message = f"SET_MTU:{mtu}"
-        if self.messenger.send_message(peer_ip, message):
-            # Wait for acknowledgment
-            for _ in range(5):  # 5 second timeout
-                response = self.messenger.receive_message()
-                if response and response[0] == "MTU_SET":
-                    return True
+        for retry in range(self.config.max_retries):
+            try:
+                self.sock.sendto(msg.pack(), (self.server_ip, self.config.server_port))
+                data, _ = self.sock.recvfrom(1024)
+                response = MTUMessage.unpack(data)
+                
+                if response.msg_type == MESSAGE_TYPES["MTU_SET"]:
+                    return response.data.get("success", False)
+                    
+            except Exception as e:
+                logging.warning(f"MTU set retry {retry + 1}: {e}")
                 time.sleep(1)
+        
         return False
+    
+    def run_test(self, server_mtu: int, client_mtu: int) -> TestResult:
+        """Run a single MTU combination test"""
+        timestamp = datetime.now().isoformat()
         
-    def test_connectivity(self, peer_ip: str) -> bool:
-        """Test basic connectivity with ping"""
-        try:
-            result = subprocess.run(['ping', '-c', '3', '-W', '2', peer_ip], 
-                                  capture_output=True, text=True)
-            return result.returncode == 0
-        except Exception:
-            return False
-            
-    def generate_mtu_ranges(self) -> List[Tuple[int, int]]:
-        """Generate MTU combinations to test"""
-        mtu_min = self.config.get('mtu_min', 1280)
-        mtu_max = self.config.get('mtu_max', 1500)
-        mtu_step = self.config.get('mtu_step', 20)
+        logging.info(f"Testing MTU combination: Server={server_mtu}, Client={client_mtu}")
         
-        server_range = range(mtu_min, mtu_max + 1, mtu_step)
-        peer_range = range(mtu_min, mtu_max + 1, mtu_step)
+        # Set server MTU
+        if not self.set_server_mtu(server_mtu):
+            return TestResult(
+                server_mtu, client_mtu, 0, 0, 999, 100,
+                timestamp, False, "Failed to set server MTU"
+            )
         
-        combinations = [(s, p) for s in server_range for p in peer_range]
+        # Set client MTU
+        if not self.finder.network_utils.set_interface_mtu(self.config.wg_interface, client_mtu):
+            return TestResult(
+                server_mtu, client_mtu, 0, 0, 999, 100,
+                timestamp, False, "Failed to set client MTU"
+            )
         
-        if self.config.get('randomize_order', False):
-            import random
-            random.shuffle(combinations)
-            
-        return combinations
+        time.sleep(self.config.mtu_change_delay)
         
-    def binary_search_mtu(self, peer_ip: str) -> Dict:
-        """Binary search for optimal MTU using bisect algorithm"""
-        self.print_header("Binary Search Mode - Finding Optimal MTU")
+        # Test connectivity
+        latency, packet_loss = self.finder.ping_test(self.server_ip)
         
-        # Start with equal MTUs for simplicity in binary search
-        low_mtu = self.config.get('mtu_min', 1280)
-        high_mtu = self.config.get('mtu_max', 1500)
-        mtu_step = self.config.get('mtu_step', 20)
-        best_speed = 0
-        best_mtu = low_mtu
+        if latency > self.config.max_latency_ms or packet_loss > 50:
+            return TestResult(
+                server_mtu, client_mtu, 0, 0, latency, packet_loss,
+                timestamp, False, "High latency or packet loss"
+            )
         
-        self.print_colored(f"Searching MTU range: {low_mtu} - {high_mtu}", 
-                         Colors.CYAN, Emojis.GEAR)
+        # Signal server to start iperf3
+        start_msg = MTUMessage(MESSAGE_TYPES["START_TEST"])
+        self.sock.sendto(start_msg.pack(), (self.server_ip, self.config.server_port))
         
-        while low_mtu <= high_mtu:
-            mid_mtu = (low_mtu + high_mtu) // 2
-            self.print_colored(f"Testing MTU: {mid_mtu}", Colors.BLUE, Emojis.CLOCK)
-            
-            result = self.test_mtu_combination(mid_mtu, mid_mtu, peer_ip)
-            
-            if result is None:
-                self.print_colored(f"MTU {mid_mtu} failed, trying lower", 
-                                 Colors.YELLOW, Emojis.WARNING)
-                high_mtu = mid_mtu - mtu_step
-                continue
-                
-            if result['avg_speed'] > best_speed:
-                best_speed = result['avg_speed']
-                best_mtu = mid_mtu
-                self.print_colored(f"New best MTU: {mid_mtu} at {best_speed:.2f} Mbps", 
-                                 Colors.GREEN, Emojis.ROCKET)
-                
-                # Try higher MTU
-                low_mtu = mid_mtu + mtu_step
-            else:
-                # Try lower MTU
-                high_mtu = mid_mtu - mtu_step
-                
-        # Fine-tune around the best MTU found
-        return self.fine_tune_mtu(best_mtu, peer_ip)
+        # Wait for server to be ready
+        time.sleep(2)
         
-    def fine_tune_mtu(self, base_mtu: int, peer_ip: str) -> Dict:
-        """Fine-tune MTU around the best found value"""
-        self.print_colored("Fine-tuning around optimal MTU...", 
-                         Colors.CYAN, Emojis.GEAR)
+        # Run upload test
+        upload_speed, _ = self.finder.iperf3.run_client(self.server_ip, reverse=False)
+        time.sleep(1)
         
-        mtu_min = self.config.get('mtu_min', 1280)
-        mtu_max = self.config.get('mtu_max', 1500)
+        # Run download test
+        download_speed, _ = self.finder.iperf3.run_client(self.server_ip, reverse=True)
         
-        fine_range = range(max(mtu_min, base_mtu - 20),
-                          min(mtu_max, base_mtu + 21), 4)
+        success = upload_speed > 0 and download_speed > 0
         
-        best_result = None
-        for mtu in fine_range:
-            result = self.test_mtu_combination(mtu, mtu, peer_ip)
-            if result and (best_result is None or 
-                          result['avg_speed'] > best_result['avg_speed']):
-                best_result = result
-                
-        return best_result or {'server_mtu': base_mtu, 'peer_mtu': base_mtu, 
-                              'avg_speed': 0}
-        
-    def full_matrix_test(self, peer_ip: str) -> Dict:
-        """Run full matrix test of all MTU combinations"""
-        self.print_header("Full Matrix Test - Testing All Combinations")
-        
-        combinations = self.generate_mtu_ranges()
-        total_tests = len(combinations)
-        
-        self.print_colored(f"Testing {total_tests} MTU combinations", 
-                         Colors.CYAN, Emojis.CHART)
-        
-        for i, (server_mtu, peer_mtu) in enumerate(combinations):
-            progress = (i + 1) / total_tests * 100
-            self.print_colored(f"Progress: {progress:.1f}% ({i+1}/{total_tests}) "
-                             f"- Testing {server_mtu}/{peer_mtu}", 
-                             Colors.BLUE, Emojis.CLOCK)
-            
-            result = self.test_mtu_combination(server_mtu, peer_mtu, peer_ip)
-            if result:
-                self.results[server_mtu][peer_mtu] = result
-            else:
-                # Mark failed combinations
-                self.results[server_mtu][peer_mtu] = {
-                    'server_mtu': server_mtu,
-                    'peer_mtu': peer_mtu,
-                    'download_speed': 0,
-                    'upload_speed': 0,
-                    'avg_speed': 0,
-                    'failed': True
-                }
-                
-            # Check for timeout/lag conditions
-            if self.should_terminate_due_to_lag():
-                self.print_colored("Terminating due to excessive lag/timeouts", 
-                                 Colors.RED, Emojis.WARNING)
-                break
-                
-        return self.best_result
-        
-    def should_terminate_due_to_lag(self) -> bool:
-        """Check if we should terminate due to excessive lag"""
-        # Implement logic to detect if connection is too slow/laggy
-        # This is a placeholder - you can implement more sophisticated detection
-        return False
-        
-    def save_results_csv(self):
-        """Save results to CSV file"""
-        output_dir = Path(self.config.get('output_dir', './results'))
-        output_dir.mkdir(exist_ok=True)
-        
-        csv_file = output_dir / f"mtu_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        
-        with open(csv_file, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['server_mtu', 'peer_mtu', 'download_speed', 
-                           'upload_speed', 'avg_speed', 'timestamp'])
-            
-            for server_mtu, peer_results in self.results.items():
-                for peer_mtu, result in peer_results.items():
-                    writer.writerow([
-                        result['server_mtu'],
-                        result['peer_mtu'], 
-                        result['download_speed'],
-                        result['upload_speed'],
-                        result['avg_speed'],
-                        result.get('timestamp', '')
-                    ])
-                    
-        self.print_colored(f"Results saved to: {csv_file}", Colors.GREEN, Emojis.CHECK)
-        return csv_file
-        
-    def generate_heatmap(self):
-        """Generate heatmap visualization of results"""
-        if not self.results:
-            self.print_colored("No results to visualize", Colors.YELLOW, Emojis.WARNING)
+        return TestResult(
+            server_mtu, client_mtu, upload_speed, download_speed,
+            latency, packet_loss, timestamp, success
+        )
+    
+    def run_full_test(self):
+        """Run full MTU test matrix"""
+        if not self.connect():
+            logging.error("Failed to connect to server")
             return
+        
+        # Generate MTU combinations
+        mtu_values = list(range(
+            self.config.mtu_min, 
+            self.config.mtu_max + 1, 
+            self.config.mtu_step
+        ))
+        
+        total_tests = len(mtu_values) ** 2
+        current_test = 0
+        
+        logging.info(f"Starting MTU test matrix: {len(mtu_values)}x{len(mtu_values)} = {total_tests} tests")
+        
+        # CSV file setup
+        csv_path = Path(self.config.output_dir) / self.config.csv_filename
+        
+        with open(csv_path, 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow([
+                'Server_MTU', 'Client_MTU', 'Upload_Speed_Mbps', 
+                'Download_Speed_Mbps', 'Latency_ms', 'Packet_Loss_%',
+                'Timestamp', 'Success', 'Error_Message'
+            ])
             
-        # Prepare data for heatmap
-        server_mtus = sorted(self.results.keys())
-        peer_mtus = sorted(set(peer_mtu for peer_results in self.results.values() 
-                              for peer_mtu in peer_results.keys()))
-        
-        # Create matrix
-        matrix = np.zeros((len(server_mtus), len(peer_mtus)))
-        
-        for i, server_mtu in enumerate(server_mtus):
-            for j, peer_mtu in enumerate(peer_mtus):
-                if peer_mtu in self.results[server_mtu]:
-                    matrix[i][j] = self.results[server_mtu][peer_mtu]['avg_speed']
+            for server_mtu in mtu_values:
+                for client_mtu in mtu_values:
+                    current_test += 1
                     
-        # Create heatmap
-        plt.figure(figsize=(12, 10))
-        sns.heatmap(matrix, 
-                   xticklabels=[str(mtu) for mtu in peer_mtus],
-                   yticklabels=[str(mtu) for mtu in server_mtus],
-                   annot=True, 
-                   fmt='.1f',
-                   cmap='viridis',
-                   cbar_kws={'label': 'Average Speed (Mbps)'})
+                    logging.info(f"Progress: {current_test}/{total_tests} ({100*current_test/total_tests:.1f}%)")
+                    
+                    result = self.run_test(server_mtu, client_mtu)
+                    self.finder.results.append(result)
+                    
+                    # Write to CSV
+                    writer.writerow([
+                        result.server_mtu, result.client_mtu,
+                        result.upload_speed, result.download_speed,
+                        result.latency, result.packet_loss,
+                        result.timestamp, result.success, result.error_message
+                    ])
+                    csvfile.flush()
+                    
+                    # Check if we should terminate due to poor performance
+                    if (result.upload_speed < self.config.min_speed_mbps and 
+                        result.download_speed < self.config.min_speed_mbps and
+                        result.success):
+                        logging.warning(f"Very low speeds detected at MTU {server_mtu}/{client_mtu}")
         
-        plt.title('WireGuard MTU Performance Heatmap')
-        plt.xlabel('Peer MTU')
-        plt.ylabel('Server MTU')
+        # Generate reports
+        self.generate_heatmap()
+        self.generate_summary()
+        
+        # Send termination signal
+        term_msg = MTUMessage(MESSAGE_TYPES["TERMINATE"])
+        self.sock.sendto(term_msg.pack(), (self.server_ip, self.config.server_port))
+        
+        logging.info("MTU testing completed!")
+    
+    def generate_heatmap(self):
+        """Generate heatmap visualization"""
+        if not self.finder.results:
+            return
+        
+        # Create DataFrame
+        df = pd.DataFrame([asdict(r) for r in self.finder.results])
+        
+        # Create pivot tables for heatmaps
+        upload_pivot = df.pivot(
+            index='server_mtu', 
+            columns='client_mtu', 
+            values='upload_speed'
+        )
+        download_pivot = df.pivot(
+            index='server_mtu', 
+            columns='client_mtu', 
+            values='download_speed'
+        )
+        
+        # Create subplots
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8))
+        
+        # Upload speed heatmap
+        sns.heatmap(
+            upload_pivot, annot=True, fmt='.1f', cmap='viridis',
+            ax=ax1, cbar_kws={'label': 'Upload Speed (Mbps)'}
+        )
+        ax1.set_title('Upload Speed by MTU Combination')
+        ax1.set_xlabel('Client MTU')
+        ax1.set_ylabel('Server MTU')
+        
+        # Download speed heatmap
+        sns.heatmap(
+            download_pivot, annot=True, fmt='.1f', cmap='viridis',
+            ax=ax2, cbar_kws={'label': 'Download Speed (Mbps)'}
+        )
+        ax2.set_title('Download Speed by MTU Combination')
+        ax2.set_xlabel('Client MTU')
+        ax2.set_ylabel('Server MTU')
+        
         plt.tight_layout()
+        plt.savefig(
+            Path(self.config.output_dir) / self.config.heatmap_filename,
+            dpi=300, bbox_inches='tight'
+        )
         
-        # Save heatmap
-        output_dir = Path(self.config.get('output_dir', './results'))
-        heatmap_file = output_dir / f"mtu_heatmap_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-        plt.savefig(heatmap_file, dpi=300, bbox_inches='tight')
-        plt.show()
+        logging.info(f"Heatmap saved to {self.config.heatmap_filename}")
+    
+    def generate_summary(self):
+        """Generate test summary"""
+        if not self.finder.results:
+            return
         
-        self.print_colored(f"Heatmap saved to: {heatmap_file}", Colors.GREEN, Emojis.CHART)
+        df = pd.DataFrame([asdict(r) for r in self.finder.results])
         
-    def run_server_mode(self):
-        """Run in server mode - coordinate with peer"""
-        self.print_header("Server Mode - Coordinating MTU Tests")
+        # Find best combinations
+        best_upload = df.loc[df['upload_speed'].idxmax()]
+        best_download = df.loc[df['download_speed'].idxmax()]
+        best_combined = df.loc[(df['upload_speed'] + df['download_speed']).idxmax()]
         
-        self.messenger.start_server()
-        peer_ip = self.config['peer_ip']
-        
-        try:
-            if self.config.get('binary_search', False):
-                best_result = self.binary_search_mtu(peer_ip)
-            else:
-                best_result = self.full_matrix_test(peer_ip)
-                
-            # Save results
-            csv_file = self.save_results_csv()
-            
-            # Generate visualizations
-            if self.config.get('generate_heatmap', True):
-                self.generate_heatmap()
-                
-            # Print final results
-            self.print_final_results(best_result)
-            
-        finally:
-            self.messenger.close()
-            
-    def run_peer_mode(self):
-        """Run in peer mode - respond to server coordination"""
-        self.print_header("Peer Mode - Responding to Server")
-        
-        self.messenger.start_server()
-        interface = self.config.get('interface', 'wg0')
-        
-        try:
-            self.print_colored("Waiting for MTU coordination messages...", 
-                             Colors.CYAN, Emojis.NETWORK)
-            
-            while True:
-                message = self.messenger.receive_message()
-                if message:
-                    msg_content, sender_ip = message
-                    
-                    if msg_content.startswith("SET_MTU:"):
-                        mtu = int(msg_content.split(":")[1])
-                        self.print_colored(f"Setting MTU to {mtu}", 
-                                         Colors.BLUE, Emojis.GEAR)
-                        
-                        if self.set_mtu(interface, mtu):
-                            self.messenger.send_message(sender_ip, "MTU_SET")
-                            self.print_colored(f"Confirmed MTU {mtu}", 
-                                             Colors.GREEN, Emojis.CHECK)
-                        else:
-                            self.messenger.send_message(sender_ip, "MTU_FAILED")
-                            
-                    elif msg_content == "TERMINATE":
-                        self.print_colored("Received termination signal", 
-                                         Colors.YELLOW, Emojis.INFO)
-                        break
-                        
-        except KeyboardInterrupt:
-            self.print_colored("Peer mode interrupted", Colors.YELLOW, Emojis.INFO)
-        finally:
-            self.messenger.close()
-            
-    def print_final_results(self, best_result: Dict):
-        """Print final results summary"""
-        self.print_header("Final Results Summary")
-        
-        if best_result and best_result.get('speed', 0) > 0:
-            self.print_colored(f"Optimal MTU Configuration:", Colors.GREEN, Emojis.ROCKET)
-            self.print_colored(f"  Server MTU: {best_result['server_mtu']}", Colors.WHITE)
-            self.print_colored(f"  Peer MTU: {best_result['peer_mtu']}", Colors.WHITE)
-            self.print_colored(f"  Best Speed: {best_result['speed']:.2f} Mbps", 
-                             Colors.GREEN, Emojis.SPEED)
-        else:
-            self.print_colored("No optimal configuration found", Colors.RED, Emojis.CROSS)
-            
-        self.print_colored(f"Log file: {self.log_file}", Colors.CYAN, Emojis.INFO)
+        summary = f"""
+WireGuard MTU Test Summary
+=========================
+Generated: {datetime.now().isoformat()}
 
-def load_config(config_file: str) -> Dict:
-    """Load configuration from file with defaults"""
-    default_config = {
-        "interface": "wg0",
-        "peer_ip": "",
-        "mtu_min": 1280,
-        "mtu_max": 1500,
-        "mtu_step": 20,
-        "test_duration": 10,
-        "mtu_change_delay": 2,
-        "messenger_port": 12345,
-        "log_level": "INFO",
-        "log_dir": "./logs",
-        "output_dir": "./results",
-        "binary_search": False,
-        "generate_heatmap": True,
-        "randomize_order": False
-    }
-    
-    if os.path.exists(config_file):
-        try:
-            with open(config_file, 'r') as f:
-                user_config = json.load(f)
-            # Merge user config with defaults
-            default_config.update(user_config)
-        except Exception as e:
-            print(f"{Colors.YELLOW}{Emojis.WARNING} Error loading config file: {e}{Colors.END}")
-            print(f"{Colors.INFO}Using default configuration{Colors.END}")
-    else:
-        print(f"{Colors.YELLOW}{Emojis.WARNING} Config file not found: {config_file}{Colors.END}")
-        print(f"{Colors.INFO}Using default configuration{Colors.END}")
-    
-    return default_config
+Test Configuration:
+- MTU Range: {self.config.mtu_min} - {self.config.mtu_max} (step: {self.config.mtu_step})
+- Total Tests: {len(df)}
+- Successful Tests: {len(df[df['success']])}
+- Failed Tests: {len(df[~df['success']])}
 
-def create_default_config():
-    """Create default configuration file"""
-    default_config = {
-        "interface": "wg0",
-        "peer_ip": "",
-        "mtu_min": 1280,
-        "mtu_max": 1500, 
-        "mtu_step": 20,
-        "test_duration": 10,
-        "mtu_change_delay": 2,
-        "messenger_port": 12345,
-        "log_level": "INFO",
-        "log_dir": "./logs",
-        "output_dir": "./results",
-        "binary_search": False,
-        "generate_heatmap": True,
-        "randomize_order": False
-    }
-    
-    with open('mtu_finder_config.json', 'w') as f:
-        json.dump(default_config, f, indent=2)
+Best Results:
+- Best Upload: {best_upload['upload_speed']:.2f} Mbps at Server MTU {best_upload['server_mtu']}, Client MTU {best_upload['client_mtu']}
+- Best Download: {best_download['download_speed']:.2f} Mbps at Server MTU {best_download['server_mtu']}, Client MTU {best_download['client_mtu']}
+- Best Combined: {best_combined['upload_speed'] + best_combined['download_speed']:.2f} Mbps at Server MTU {best_combined['server_mtu']}, Client MTU {best_combined['client_mtu']}
+
+Statistics:
+- Average Upload Speed: {df['upload_speed'].mean():.2f} Mbps
+- Average Download Speed: {df['download_speed'].mean():.2f} Mbps
+- Average Latency: {df['latency'].mean():.2f} ms
+- Average Packet Loss: {df['packet_loss'].mean():.2f}%
+"""
         
-    print(f"{Colors.GREEN}{Emojis.CHECK} Created default config: mtu_finder_config.json{Colors.END}")
+        summary_path = Path(self.config.output_dir) / 'summary.txt'
+        with open(summary_path, 'w') as f:
+            f.write(summary)
+        
+        print(summary)
+        logging.info(f"Summary saved to {summary_path}")
 
 def main():
     parser = argparse.ArgumentParser(description='WireGuard MTU Finder')
-    parser.add_argument('mode', choices=['server', 'peer'], 
-                       help='Run mode: server (coordinator) or peer (responder)')
-    parser.add_argument('--config', '-c', default='mtu_finder_config.json',
-                       help='Configuration file path')
-    parser.add_argument('--peer-ip', help='Peer IP address (server mode)')
-    parser.add_argument('--interface', '-i', default='wg0', 
-                       help='WireGuard interface name')
-    parser.add_argument('--binary-search', '-b', action='store_true',
-                       help='Use binary search instead of full matrix')
-    parser.add_argument('--create-config', action='store_true',
-                       help='Create default configuration file')
+    parser.add_argument('--mode', choices=['server', 'client'], required=True,
+                        help='Run mode: server or client')
+    parser.add_argument('--server-ip', help='Server IP address (required for client mode)')
+    parser.add_argument('--config', help='Configuration file path')
+    parser.add_argument('--interface', default='wg0', help='WireGuard interface name')
+    parser.add_argument('--port', type=int, default=12345, help='Communication port')
+    parser.add_argument('--mtu-min', type=int, default=1280, help='Minimum MTU to test')
+    parser.add_argument('--mtu-max', type=int, default=1500, help='Maximum MTU to test')
+    parser.add_argument('--mtu-step', type=int, default=20, help='MTU step size')
+    parser.add_argument('--duration', type=int, default=10, help='IPerf3 test duration')
+    parser.add_argument('--output-dir', default='wg_mtu_results', help='Output directory')
     
     args = parser.parse_args()
     
-    if args.create_config:
-        create_default_config()
-        return
-        
     # Load configuration
-    config = load_config(args.config)
+    config = Config()
     
     # Override with command line arguments
-    if args.peer_ip:
-        config['peer_ip'] = args.peer_ip
     if args.interface:
-        config['interface'] = args.interface
-    if args.binary_search:
-        config['binary_search'] = True
-        
-    # Validate required settings
-    if args.mode == 'server' and not config.get('peer_ip'):
-        print(f"{Colors.RED}{Emojis.CROSS} Peer IP is required for server mode{Colors.END}")
-        print(f"{Colors.YELLOW}{Emojis.INFO} Use --peer-ip option or set 'peer_ip' in config file{Colors.END}")
+        config.wg_interface = args.interface
+    if args.port:
+        config.server_port = args.port
+    if args.mtu_min:
+        config.mtu_min = args.mtu_min
+    if args.mtu_max:
+        config.mtu_max = args.mtu_max
+    if args.mtu_step:
+        config.mtu_step = args.mtu_step
+    if args.duration:
+        config.iperf3_duration = args.duration
+    if args.output_dir:
+        config.output_dir = args.output_dir
+    
+    # Check requirements
+    if args.mode == 'client' and not args.server_ip:
+        print("Error: --server-ip is required for client mode")
         sys.exit(1)
     
-    # Validate interface exists if specified
-    interface = config.get('interface', 'wg0')
-    try:
-        result = subprocess.run(['ip', 'link', 'show', interface], 
-                              capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"{Colors.YELLOW}{Emojis.WARNING} Interface {interface} not found{Colors.END}")
-            print(f"{Colors.INFO}Available interfaces:{Colors.END}")
-            subprocess.run(['ip', 'link', 'show'])
-    except Exception:
-        pass  # Continue anyway, let the script handle interface issues
-        
-    # Create and run MTU finder
-    finder = WireGuardMTUFinder(config)
+    # Check if running as root
+    if os.geteuid() != 0:
+        print("Warning: This script requires root privileges to change MTU settings")
+        print("Please run with sudo")
+        sys.exit(1)
     
     try:
         if args.mode == 'server':
-            finder.run_server_mode()
+            server = MTUServer(config)
+            asyncio.run(server.start())
         else:
-            finder.run_peer_mode()
+            client = MTUClient(config, args.server_ip)
+            client.run_full_test()
+            
     except KeyboardInterrupt:
-        print(f"\n{Colors.YELLOW}{Emojis.WARNING} Operation interrupted by user{Colors.END}")
+        print("\nOperation cancelled by user")
     except Exception as e:
-        print(f"{Colors.RED}{Emojis.CROSS} Error: {e}{Colors.END}")
+        print(f"Error: {e}")
         sys.exit(1)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
