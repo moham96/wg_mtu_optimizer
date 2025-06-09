@@ -207,8 +207,8 @@ class MTUFinder:
         
         # Setup logging
         self.setup_logging()
+        logging.debug(f"MTUFinder initialized with config: {self.config}")
         
-    
     def setup_logging(self):
         """Setup logging configuration"""
         log_format = '%(asctime)s - %(levelname)s - %(message)s'
@@ -222,9 +222,11 @@ class MTUFinder:
                 logging.StreamHandler()
             ]
         )
+        logging.debug("Logging configured for MTUFinder")
     
     def ping_test(self, target_ip: str) -> Tuple[float, float]:
         """Perform ping test to measure latency and packet loss"""
+        logging.debug(f"Starting ping test to {target_ip}")
         try:
             result = subprocess.run([
                 "ping", "-c", "5", "-W", str(self.config.ping_timeout), target_ip
@@ -236,27 +238,25 @@ class MTUFinder:
                 loss = 100.0
                 
                 for line in lines:
-                    # Parse packet loss: "5 packets transmitted, 5 received, 0% packet loss"
                     if 'packet loss' in line:
                         try:
                             loss_str = line.split('%')[0].split()[-1]
                             loss = float(loss_str)
+                            logging.debug(f"Parsed packet loss: {loss}%")
                         except (IndexError, ValueError):
-                            pass
+                            logging.debug("Failed to parse packet loss line")
                     
-                    # Parse latency: "rtt min/avg/max/mdev = 0.123/0.456/0.789/0.012 ms"
                     if 'rtt min/avg/max' in line or ('avg' in line and 'ms' in line and '/' in line):
                         try:
-                            # Extract the part after '='
                             if '=' in line:
                                 stats_part = line.split('=')[1].strip()
-                                # Remove 'ms' and split by '/'
                                 stats_part = stats_part.replace('ms', '').strip()
                                 values = stats_part.split('/')
                                 if len(values) >= 2:
-                                    latency = float(values[1])  # avg is the second value
+                                    latency = float(values[1])
+                                    logging.debug(f"Parsed latency: {latency} ms")
                         except (IndexError, ValueError):
-                            pass
+                            logging.debug("Failed to parse latency line")
                 
                 return latency, loss
         except Exception as e:
@@ -354,19 +354,23 @@ class MTUClient:
         self.server_ip = server_ip
         self.finder = MTUFinder(config)
         self.sock = None
+        logging.debug(f"MTUClient initialized for server {server_ip} with config: {self.config}")
     
     def connect(self) -> bool:
         """Connect to MTU server"""
         try:
+            logging.debug("Creating UDP socket for client")
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.sock.settimeout(self.config.udp_timeout)
             
             # Test connection with ping
             ping_msg = MTUMessage(MESSAGE_TYPES["PING"])
+            logging.debug(f"Sending PING to server {self.server_ip}:{self.config.server_port}")
             self.sock.sendto(ping_msg.pack(), (self.server_ip, self.config.server_port))
             
             data, _ = self.sock.recvfrom(1024)
             response = MTUMessage.unpack(data)
+            logging.debug(f"Received response to PING: {response.msg_type}")
             
             if response.msg_type == MESSAGE_TYPES["PONG"]:
                 logging.info("Successfully connected to MTU server")
@@ -380,12 +384,15 @@ class MTUClient:
     def set_server_mtu(self, mtu: int) -> bool:
         """Set MTU on server"""
         msg = MTUMessage(MESSAGE_TYPES["SET_MTU"], {"mtu": mtu})
+        logging.debug(f"Requesting server to set MTU to {mtu}")
         
         for retry in range(self.config.max_retries):
             try:
                 self.sock.sendto(msg.pack(), (self.server_ip, self.config.server_port))
+                logging.debug(f"Sent SET_MTU (attempt {retry+1})")
                 data, _ = self.sock.recvfrom(1024)
                 response = MTUMessage.unpack(data)
+                logging.debug(f"Received MTU_SET response: {response.data}")
                 
                 if response.msg_type == MESSAGE_TYPES["MTU_SET"]:
                     return response.data.get("success", False)
@@ -404,6 +411,7 @@ class MTUClient:
         
         # Set server MTU
         if not self.set_server_mtu(server_mtu):
+            logging.error(f"Failed to set server MTU to {server_mtu}")
             return TestResult(
                 server_mtu, client_mtu, 0, 0, 999, 100,
                 timestamp, False, "Failed to set server MTU"
@@ -411,6 +419,7 @@ class MTUClient:
         
         # Set client MTU
         if not self.finder.network_utils.set_interface_mtu(self.config.wg_interface, client_mtu):
+            logging.error(f"Failed to set client MTU to {client_mtu}")
             return TestResult(
                 server_mtu, client_mtu, 0, 0, 999, 100,
                 timestamp, False, "Failed to set client MTU"
@@ -420,8 +429,10 @@ class MTUClient:
         
         # Test connectivity
         latency, packet_loss = self.finder.ping_test(self.server_ip)
+        logging.debug(f"Ping test results: latency={latency}, packet_loss={packet_loss}")
         
         if latency > self.config.max_latency_ms or packet_loss > 50:
+            logging.warning(f"High latency or packet loss: latency={latency}, loss={packet_loss}")
             return TestResult(
                 server_mtu, client_mtu, 0, 0, latency, packet_loss,
                 timestamp, False, "High latency or packet loss"
@@ -429,19 +440,23 @@ class MTUClient:
         
         # Signal server to start iperf3
         start_msg = MTUMessage(MESSAGE_TYPES["START_TEST"])
+        logging.debug("Sending START_TEST to server")
         self.sock.sendto(start_msg.pack(), (self.server_ip, self.config.server_port))
         
         # Wait for server to be ready
         time.sleep(2)
         
         # Run upload test
+        logging.debug("Running upload test (client -> server)")
         upload_speed, _ = self.finder.iperf3.run_client(self.server_ip, reverse=False)
         time.sleep(1)
         
         # Run download test
+        logging.debug("Running download test (server -> client)")
         download_speed, _ = self.finder.iperf3.run_client(self.server_ip, reverse=True)
         
         success = upload_speed > 0 and download_speed > 0
+        logging.debug(f"Test result: upload={upload_speed}, download={download_speed}, success={success}")
         
         return TestResult(
             server_mtu, client_mtu, upload_speed, download_speed,
