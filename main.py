@@ -651,19 +651,20 @@ def main():
             sys.exit(1)
     
     # Override with command line arguments
-    if args.interface:
+    # Only override if the user explicitly set the argument (i.e., not using the default)
+    if 'interface' in args and args.interface != parser.get_default('interface'):
         config.wg_interface = args.interface
-    if args.port:
+    if 'port' in args and args.port != parser.get_default('port'):
         config.server_port = args.port
-    if args.mtu_min:
+    if 'mtu_min' in args and args.mtu_min != parser.get_default('mtu_min'):
         config.mtu_min = args.mtu_min
-    if args.mtu_max:
+    if 'mtu_max' in args and args.mtu_max != parser.get_default('mtu_max'):
         config.mtu_max = args.mtu_max
-    if args.mtu_step:
+    if 'mtu_step' in args and args.mtu_step != parser.get_default('mtu_step'):
         config.mtu_step = args.mtu_step
-    if args.duration:
+    if 'duration' in args and args.duration != parser.get_default('duration'):
         config.iperf3_duration = args.duration
-    if args.output_dir:
+    if 'output_dir' in args and args.output_dir != parser.get_default('output_dir'):
         config.output_dir = args.output_dir
     
     # Check requirements
