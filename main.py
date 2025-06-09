@@ -158,11 +158,12 @@ class IPerf3Runner:
         self.config = config
     
     def run_server(self) -> subprocess.Popen:
-        """Start iperf3 server"""
+        """Start iperf3 server (persistent for multiple tests)"""
         cmd = [
-            "iperf3", "-s", "-p", str(self.config.iperf3_port),
-            "-1"  # Exit after one test
+            "iperf3", "-s", "-p", str(self.config.iperf3_port)
+            # Removed "-1" to keep server running
         ]
+        logging.debug(f"Starting iperf3 server with command: {' '.join(cmd)}")
         return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     
     def run_client(self, server_ip: str, reverse: bool = False) -> Tuple[float, float]:
@@ -333,18 +334,23 @@ class MTUServer:
                 time.sleep(self.config.mtu_change_delay)
             
         elif message.msg_type == MESSAGE_TYPES["START_TEST"]:
-            # Start iperf3 server
-            server_proc = self.finder.iperf3.run_server()
-            
+            # Start iperf3 server (if not already running)
+            if not hasattr(self, 'iperf3_proc') or self.iperf3_proc.poll() is not None:
+                self.iperf3_proc = self.finder.iperf3.run_server()
+                logging.debug("Started persistent iperf3 server process")
+            else:
+                logging.debug("iperf3 server already running")
             response = MTUMessage(MESSAGE_TYPES["TEST_COMPLETE"])
             sock.sendto(response.pack(), addr)
-            
-            # Wait for iperf3 to complete
-            server_proc.wait()
             
         elif message.msg_type == MESSAGE_TYPES["TERMINATE"]:
             logging.info("Received termination signal")
             self.running = False
+            # Terminate iperf3 server if running
+            if hasattr(self, 'iperf3_proc') and self.iperf3_proc.poll() is None:
+                self.iperf3_proc.terminate()
+                self.iperf3_proc.wait()
+                logging.debug("Terminated iperf3 server process")
 
 class MTUClient:
     """Client component for MTU testing"""
