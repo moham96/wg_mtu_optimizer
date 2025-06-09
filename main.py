@@ -621,6 +621,20 @@ def main():
     # Load configuration
     config = Config()
     
+    # Load from config file if specified
+    if args.config:
+        try:
+            with open(args.config, 'r') as f:
+                config_data = json.load(f)
+            for key, value in config_data.items():
+                if hasattr(config, key):
+                    setattr(config, key, value)
+            logging.basicConfig(level=getattr(logging, config.log_level, "INFO"))
+            logging.debug(f"Loaded configuration from {args.config}: {config_data}")
+        except Exception as e:
+            print(f"Error loading config file: {e}")
+            sys.exit(1)
+    
     # Override with command line arguments
     if args.interface:
         config.wg_interface = args.interface
