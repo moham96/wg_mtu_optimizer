@@ -163,8 +163,14 @@ class IPerf3Runner:
             "iperf3", "-s", "-p", str(self.config.iperf3_port)
             # Removed "-1" to keep server running
         ]
+        log_dir = Path(self.config.output_dir)
+        log_dir.mkdir(exist_ok=True)
+        stdout_log = log_dir / "iperf3_server_stdout.log"
+        stderr_log = log_dir / "iperf3_server_stderr.log"
         logging.debug(f"Starting iperf3 server with command: {' '.join(cmd)}")
-        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout_file = open(stdout_log, "ab")
+        stderr_file = open(stderr_log, "ab")
+        return subprocess.Popen(cmd, stdout=stdout_file, stderr=stderr_file)
     
     def run_client(self, server_ip: str, reverse: bool = False) -> Tuple[float, float]:
         """Run iperf3 client test"""
